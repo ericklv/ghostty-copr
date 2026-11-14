@@ -30,12 +30,9 @@ Override with `GHOSTTY_GL_FALLBACK=auto|force|off`. An explicit `LIBGL_ALWAYS_SO
 
 ```bash
 sudo dnf copr enable eleve/ghostty
-# prefer this repo over others shipping ghostty (e.g. Terra)
 sudo dnf config-manager setopt copr:copr.fedorainfracloud.org:eleve:ghostty.priority=50
-sudo dnf install ghostty
+sudo dnf install ghostty            # or, replacing Terra: sudo dnf distro-sync 'ghostty*'
 ```
-
-Replacing an existing Terra install: `sudo dnf distro-sync 'ghostty*'` after setting the priority.
 
 ## Workflow
 
