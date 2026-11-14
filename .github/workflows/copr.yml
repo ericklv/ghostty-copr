@@ -1,0 +1,108 @@
+name: copr
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # daily: picks up new stable ghostty tags
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Ghostty version without the leading v (empty = latest stable tag)
+        required: false
+        default: ""
+      release:
+        description: RPM release number; raise it to rebuild a published version
+        required: false
+        default: "1"
+      force:
+        description: Build even if this version is already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copr
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: ghostty-org/ghostty
+  COPR_PROJECT: eleve/ghostty
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: registry.fedoraproject.org/fedora:latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install packaging tools
+        run: dnf install -y --setopt=install_weak_deps=False rpm-build rpmdevtools copr-cli jq
+
+      - uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          if [[ -z "$version" ]]; then
+            # ghostty publishes no GitHub releases; pick the highest vX.Y.Z tag
+            version=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${UPSTREAM}/tags?per_page=100" \
+              | jq -r '.[].name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("v")' \
+              | sort -V | tail -1)
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version: $version" >&2; exit 1; }
+
+          owner="${COPR_PROJECT%/*}" project="${COPR_PROJECT#*/}"
+          published=$(curl -fsSL "https://copr.fedorainfracloud.org/api_3/package?ownername=${owner}&projectname=${project}&packagename=ghostty&with_latest_succeeded_build=true" \
+            | jq -r '.builds.latest_succeeded.source_package.version // empty' || true)
+          echo "upstream: $version, published: ${published:-none}"
+
+          build=true
+          if [[ "${published%-*}" == "$version" && "$FORCE" != "true" ]]; then
+            echo "v$version is already published, skipping"
+            build=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Build the source RPM
+        if: steps.version.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE: ${{ inputs.release || '1' }}
+        run: |
+          top="$PWD/rpmbuild"
+          mkdir -p "$top"/{SOURCES,SPECS,SRPMS}
+          sed -e "s/^Version:.*/Version:        ${VERSION}/" \
+              -e "s/^Release:.*/Release:        ${RELEASE}%{?dist}/" \
+              ghostty.spec > "$top/SPECS/ghostty.spec"
+          cp src/ghostty.sh src/ghostty-gl-probe.c "$top/SOURCES/"
+          spectool -g -C "$top/SOURCES" "$top/SPECS/ghostty.spec"
+          rpmbuild -bs --define "_topdir $top" "$top/SPECS/ghostty.spec"
+          mkdir -p dist && cp "$top"/SRPMS/*.src.rpm dist/
+
+      - name: Upload the source RPM
+        if: steps.version.outputs.build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghostty-srpm-${{ steps.version.outputs.version }}
+          path: dist/*.src.rpm
+          if-no-files-found: error
+
+      - name: Submit to COPR and wait
+        if: steps.version.outputs.build == 'true'
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          install -d -m 700 ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+          copr-cli build "$COPR_PROJECT" dist/*.src.rpm
